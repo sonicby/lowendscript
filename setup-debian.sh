@@ -12,6 +12,7 @@ function check_install {
 		while [ -n "$1" ]
 		do
 			DEBIAN_FRONTEND=noninteractive apt-get -q -y install "$1"
+			apt-get clean
 			print_info "$1 installed for $executable"
 			shift
 		done
@@ -24,6 +25,7 @@ function check_remove {
 	if [ -n "`which "$1" 2>/dev/null`" ]
 	then
 		DEBIAN_FRONTEND=noninteractive apt-get -q -y remove --purge "$2"
+		apt-get clean
 		print_info "$2 removed"
 	else
 		print_warn "$2 is not installed"
@@ -86,8 +88,9 @@ function print_warn {
 }
 
 
-## Installation of Applications
-
+############################################################
+# applications
+############################################################
 
 function install_dash {
 	check_install dash dash
@@ -122,7 +125,6 @@ function install_vim {
 }
 
 function install_dropbear {
-
 	if [ -z "$1" ]
 	then
 		die "Usage: `basename $0` dropbear [ssh-port-#]"
@@ -153,6 +155,8 @@ service ssh
 }
 END
 	invoke-rc.d xinetd restart
+
+	print_info "dropbear is installed and running"
 }
 
 function install_exim4 {
@@ -225,13 +229,24 @@ function install_mysql {
 	# Install a low-end copy of the my.cnf to disable InnoDB
 	invoke-rc.d mysql stop
 	cat > /etc/mysql/conf.d/lowendbox.cnf <<END
+# These values override values from /etc/mysql/my.cnf
+
 [mysqld]
 key_buffer = 12M
 query_cache_size = 0
 table_cache = 32
 
-ignore_builtin_innodb
+init_connect='SET collation_connection = utf8_unicode_ci'
+character-set-server = utf8
+collation-server = utf8_unicode_ci
+
 default_storage_engine=MyISAM
+skip-innodb
+
+log-slow-queries=/var/log/mysql/slow-queries.log
+
+[client]
+default-character-set = utf8
 END
 	invoke-rc.d mysql start
 
@@ -252,7 +267,7 @@ function install_php {
 	check_install php5-cli php5-cli
 
 	# PHP modules
-	DEBIAN_FRONTEND=noninteractive apt-get -y install php-apc php5-suhosin php5-curl php5-gd php5-intl php5-mcrypt php-gettext php5-mysql php5-sqlite
+	DEBIAN_FRONTEND=noninteractive apt-get -y install php5-apc php5-suhosin php5-curl php5-gd php5-intl php5-mcrypt php-gettext php5-mysql php5-sqlite
 
 	echo 'Using PHP-FPM to manage PHP processes'
 	echo ' '
@@ -266,7 +281,7 @@ cat > /etc/php5/conf.d/apc.ini <<END
 extension=apc.so
 apc.enabled=1
 apc.shm_segments=1
-apc.shm_size=16M
+apc.shm_size=32M
 apc.ttl=7200
 apc.user_ttl=7200
 apc.num_files_hint=1024
@@ -398,18 +413,38 @@ location ~ \.php$ {
 # The exploit also can be stopped by adding "cgi.fix_pathinfo = 0" in your php.ini file.
 END
 
+	# remove localhost-config
+	rm -f /etc/nginx/sites-enabled/default
+
 	echo 'Created /etc/nginx/php.conf for PHP sites'
 	echo 'Created /etc/nginx/sites-available/default_php sample vhost'
 	echo ' '
+
+ if [ -f /etc/nginx/sites-available/default ]
+	then
+		# Made IPV6 Listener not conflict and throw errors
+		sed -i \
+			"s/listen \[::]:80 default_server;/listen [::]:80 default_server ipv6only=on;/" \
+			/etc/nginx/sites-available/default
+ fi
+
  if [ -f /etc/nginx/nginx.conf ]
 	then
+		# one worker for each CPU and max 1024 connections/worker
+		cpu_count=`grep -c ^processor /proc/cpuinfo`
 		sed -i \
-			"s/worker_processes 4;/worker_processes 1;/" \
+			"s/worker_processes [0-9]*;/worker_processes $cpu_count;/" \
 			/etc/nginx/nginx.conf
 		sed -i \
-			"s/worker_connections 768;/worker_connections 1024;/" \
+			"s/worker_connections [0-9]*;/worker_connections 1024;/" \
+			/etc/nginx/nginx.conf
+		# Enable advanced compression
+		sed -i \
+			"s/# gzip_/gzip_/g" \
 			/etc/nginx/nginx.conf
  fi
+
+	# restart nginx
 	invoke-rc.d nginx restart
 }
 
@@ -440,6 +475,7 @@ server {
 	server_name www.$1 $1;
 	root /var/www/$1/public;
 	index index.html index.htm index.php;
+	client_max_body_size 32m;
 
 	access_log  /var/www/$1/access.log;
 	error_log  /var/www/$1/error.log;
@@ -658,7 +694,7 @@ END
 
 function install_iptables {
 
-	check_install iptables
+	check_install iptables iptables
 
 	if [ -z "$1" ]
 	then
@@ -711,6 +747,8 @@ function install_iptables {
 # log iptables denied calls (Can grow log files fast!)
 #-A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables denied: " --log-level 7
 
+# Misc
+
 # Reject all other inbound - default deny unless explicitly allowed policy
 #-A INPUT -j REJECT
 #-A FORWARD -j REJECT
@@ -751,10 +789,9 @@ function remove_unneeded {
 	# before running apt-get update.
 	check_remove /usr/sbin/rsyslogd rsyslog
 
-	# Other packages that seem to be pretty common in standard OpenVZ
-	# templates.
+	# Other packages that are quite common in standard OpenVZ templates.
 	check_remove /usr/sbin/apache2 'apache2*'
-	check_remove /usr/sbin/named bind9
+	check_remove /usr/sbin/named 'bind9*'
 	check_remove /usr/sbin/smbd 'samba*'
 	check_remove /usr/sbin/nscd nscd
 
@@ -945,17 +982,18 @@ function fix_locale {
 	dpkg-reconfigure locales
 }
 
-function apt_clean_all {
-	apt-get clean all
+function apt_clean {
+	apt-get -q -y autoclean
+	apt-get -q -y clean
 }
 
 function update_upgrade {
-	# Run through the apt-get update/upgrade first. This should be done before
-	# we try to install any package
+	# Run through the apt-get update/upgrade first.
+	# This should be done before we try to install any package
 	apt-get -q -y update
 	apt-get -q -y upgrade
 
-	# also remove the orphaned stuf
+	# also remove the orphaned stuff
 	apt-get -q -y autoremove
 }
 
@@ -964,7 +1002,188 @@ function update_timezone {
 }
 
 
-########################################################################
+############################################################
+# Install 3proxy (version 0.6.1, perfect proxy for LEB, supports authentication, easy config)
+############################################################
+function install_3proxy {
+
+	if [ -z "$1" ]
+	then
+		die "Usage: `basename $0` 3proxy [http-proxy port #]"
+	fi
+        echo "You have chosen port $http_porty"
+	# Build 3proxy
+	echo "Downloading and building 3proxy"
+	mkdir /tmp/proxy
+	cd /tmp/proxy
+	wget http://www.3proxy.ru/0.6.1/3proxy-0.6.1.tgz
+	tar -xvzf 3proxy-0.6.1.tgz
+	rm 3proxy-0.6.1.tgz
+	cd 3proxy-0.6.1
+	apt-get install build-essential
+	make -f Makefile.Linux
+	
+	# Navigate to 3proxy Install Directory
+	cd src
+	mkdir /etc/3proxy/
+	
+	# Move 3proxy program to a non-temporary location and navigate there
+	mv 3proxy /etc/3proxy/
+	cd /etc/3proxy/
+	
+	# Create a Log File
+	touch /var/log/3proxy.log
+	
+	# Create basic config that sets up HTTP proxy with user authentication
+	touch /etc/3proxy/3proxy.cfg
+	
+	cat > "/etc/3proxy/3proxy.cfg" <<END
+# Specify valid name servers. You can locate them on your VPS in /etc/resolv.conf
+#
+nserver 8.8.8.8
+nserver 8.8.4.4
+# Leave default cache size for DNS requests:
+#
+nscache 65536
+# Leave default timeout as well:
+#
+timeouts 1 5 30 60 180 1800 15 60
+# If your server has several IP-addresses, you need to provide an external one
+# Alternatively, you may ignore this line
+#external YOURSEVERIP
+# Provide the IP-address to be listened
+# If you ignore this line, proxy will listen all the server.s IP-addresses
+#internal YOURSEVERIP
+# Create users proxyuser1 and proxyuser2 and specify a password
+#
+users \$/etc/3proxy/.proxyauth
+# Specify daemon as a start mode
+#
+daemon
+# and the path to logs, and log format. Creation date will be added to a log name
+log /var/log/3proxy.log
+logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+# Compress the logs using gzip
+#
+archiver gz /usr/bin/gzip %F
+# store the logs for 30 days
+rotate 30
+# Configuring http(s) proxy
+#
+# enable strong authorization. To disable authentication, simply change to 'auth none'
+# added authentication caching to make life easier
+authcache user 60
+auth strong cache
+# and restrict access for ports via http(s)-proxy and deny access to local interfaces
+#
+deny * * 127.0.0.1,192.168.1.1
+allow * * * 80-88,8080-8088 HTTP
+allow * * * 443,8443 HTTPS
+# run http-proxy ... without ntlm-authorization, complete anonymity and port ...
+#
+proxy -n -p$1 -a
+# Configuring socks5-proxy
+#
+# enable strong authorization and authentication caching
+#
+# Purge the access-list of http-proxy and allow certain users
+#
+# set the maximum number of simultaneous connections to 32
+#authcache user 60
+#auth strong cache
+#flush
+#allow userdefined
+#socks
+END
+	
+	# Give appropriate permissions for config file
+	chmod 600 /etc/3proxy/3proxy.cfg
+	
+	# Create external user authentication file
+	touch /etc/3proxy/.proxyauth
+	chmod 600 /etc/3proxy/.proxyauth 
+	cat > "/etc/3proxy/.proxyauth" <<END
+## addusers in this format:
+## user:CL:password
+## see for documenation:  http://www.3proxy.ru/howtoe.asp#USERS
+END
+	
+	# Create initialization scripty so 3proxy starts with system
+	touch /etc/init.d/3proxy
+	chmod  +x /etc/init.d/3proxy
+	cat > "/etc/init.d/3proxy" <<END
+#!/bin/sh
+#
+# chkconfig: 2345 20 80
+# description: 3proxy tiny proxy server
+#
+#
+#
+#
+
+case "\$1" in
+   start)
+       echo Starting 3Proxy
+
+       /etc/3proxy/3proxy /etc/3proxy/3proxy.cfg
+       ;;
+
+   stop)
+       echo Stopping 3Proxy
+       /usr/bin/killall 3proxy
+       ;;
+
+   restart|reload)
+       echo Reloading 3Proxy
+       /usr/bin/killall -s USR1 3proxy
+       ;;
+   *)
+       echo Usage: \$0 "{start|stop|restart}"
+       exit 1
+esac
+exit 0
+
+END
+
+	# Make sure 3proxy starts with system
+
+	update-rc.d 3proxy defaults	
+
+	# Add Iptable entry for specified port
+	echo "Adding necessary Iptable entry"
+	iptables -I INPUT -p tcp --dport $1 -j ACCEPT
+	if [ -f /etc/iptables.up.rules ];
+	then
+	iptables-save < /etc/iptables.up.rules
+	fi
+	echo ''
+	echo '3proxy successfully installed, before you can use it you must add a user and password, for proxy authentication. ' 
+	echo 'This can be done using the "3proxyauth [user] [password]" it will add the user to the 3proxy auth file. '
+	echo 'If you do not want authentication, edit the 3proxy config file /etc/3proxy/3proxy.cfg  and set authentication to none (auth none)'
+	echo 'This will leave your http proxy open to anyone and everyone.'
+	
+	/etc/init.d/3proxy start
+	
+	echo "3proxy started"
+}
+
+function 3proxyauth {
+
+	if [[ -z "$1" || -z "$2" ]]
+	then
+		die "Usage: `basename $0` 3proxyauth username password"
+	fi
+	
+	if [ -f /etc/3proxy/.proxyauth ];
+	then
+	echo "$1:CL:$2" >> "/etc/3proxy/.proxyauth"
+	echo "User: $1 successfully added"
+	else
+	echo "Please install 3proxy (through this script) first."
+	fi
+
+}
+######################################################################## 
 # START OF PROGRAM
 ########################################################################
 export PATH=/bin:/usr/bin:/sbin:/usr/sbin
@@ -1001,6 +1220,12 @@ iptables)
 dropbear)
 	install_dropbear $2
 	;;
+3proxy)
+	install_3proxy $2
+	;;
+3proxyauth)
+	3proxyauth $2 $3
+	;;	
 ps_mem)
 	install_ps_mem
 	;;
@@ -1040,23 +1265,24 @@ system)
 	install_iotop
 	install_iftop
 	install_syslogd
+	apt_clean
 	;;
 *)
 	show_os_arch_version
 	echo '  '
 	echo 'Usage:' `basename $0` '[option] [argument]'
 	echo 'Available options (in recomended order):'
-	echo '  - dotdeb                 (install dotdeb apt source for nginx +1.0)'
+	echo '  - dotdeb                 (install dotdeb apt source for nginx 1.2+)'
 	echo '  - system                 (remove unneeded, upgrade system, install software)'
-	echo '  - exim4                  (install exim4 mail server)'
 	echo '  - dropbear  [port]       (SSH server)'
 	echo '  - iptables  [port]       (setup basic firewall with HTTP(S) open)'
 	echo '  - mysql                  (install MySQL and set root password)'
 	echo '  - nginx                  (install nginx and create sample PHP vhosts)'
 	echo '  - php                    (install PHP5-FPM with APC, cURL, suhosin, etc...)'
+	echo '  - exim4                  (install exim4 mail server)'
 	echo '  - site      [domain.tld] (create nginx vhost and /var/www/$site/public)'
-	echo '  - wordpress      [domain.tld] (create nginx vhost and /var/www/$wordpress/public)'
 	echo '  - mysqluser [domain.tld] (create matching mysql user and database)'
+	echo '  - wordpress [domain.tld] (create nginx vhost and /var/www/$wordpress/public)'
 	echo '  '
 	echo '... and now some extras'
 	echo '  - info                   (Displays information about the OS, ARCH and VERSION)'
@@ -1068,6 +1294,8 @@ system)
 	echo '  - locale                 (Fix locales issue with OpenVZ Ubuntu templates)'
 	echo '  - webmin                 (Install Webmin for VPS management)'
 	echo '  - test                   (Run the classic disk IO and classic cachefly network test)'
+	echo '  - 3proxy                 (Install 3proxy - Free tiny proxy server, with authentication support, HTTP, SOCKS5 and whatever you can throw at it)'
+	echo '  - 3proxyauth             (add users/passwords to your proxy user authentication list)'
 	echo '  '
 	;;
 esac
